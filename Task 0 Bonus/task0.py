@@ -149,196 +149,51 @@ def control_loop(c):
     """
     Main control loop thread for robot behavior.
 
-    Strategy: Line-follow along the black square border.
-    Sensors (indices 0-4):
-      0 = left IR      1 = right IR      2 = middle IR
-      3 = left-corner  4 = right-corner
-
-    A sensor value < BLACK_THRESH means it is OVER the black line.
-
-    Square logic:
-      - Follow the line (middle sensor keeps us on track)
-      - When a corner sensor fires → we've reached a corner
-      - Stop, turn 90° until the middle sensor re-acquires the line
-      - Repeat 4 times, then stop at the original start corner
+    Time-based square path:
+    - Move forward for one side
+    - Turn left 90 degrees
+    - Repeat 4 times
+    - Stop at the starting point
     """
 
-    # Enable TCP_NODELAY to disable network buffering and prevent concatenated packets
-    try:
-        import socket
-        c.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except Exception:
-        pass
+    FORWARD_SPEED = 2
+    TURN_SPEED = 1.5
 
-    # ── Thresholds & speeds ──────────────────────────────────────
-    BLACK_THRESH   = 0.12   # sensor value below this = on black line
-    FORWARD_SPEED  = 1.2    # straight-line speed (slightly reduced for stability)
-    TURN_SPEED     = 0.5    # in-place turn speed (slower for high precision)
-    SLOW_SPEED     = 0.4    # correction speed while line-following
-    LOOP_DT        = 0.05   # control loop period (seconds)
-    # ─────────────────────────────────────────────────────────────
+    SIDE_TIME = 18.01
+    TURN_TIME = 2.28
 
-    # ── Local shadowed set_motor to prevent bridge TCP collisions ──
-    _global_set_motor = globals()['set_motor']
-    last_left = [None]
-    last_right = [None]
-    last_send_time = [0.0]
+    PAUSE_TIME = 0.20
+    START_DELAY = 1.00
 
-    def set_motor(client_obj, left, right):
-        # Round to avoid float precision noise
-        left = round(left, 3)
-        right = round(right, 3)
-        
-        # Send ONLY if speeds changed
-        if left != last_left[0] or right != last_right[0]:
-            now = time.time()
-            elapsed = now - last_send_time[0]
-            # Enforce at least 50ms gap between consecutive socket writes
-            if elapsed < 0.05:
-                time.sleep(0.05 - elapsed)
-            _global_set_motor(client_obj, left, right)
-            last_left[0] = left
-            last_right[0] = right
-            last_send_time[0] = time.time()
+    def stop_robot():
+        set_motor(c, 0.0, 0.0)
 
-    # Sensor validation state to filter out TCP/bridge parsing drops to 0.0
-    last_valid_sensors = [0.6] * 5
+    print("Starting timed square path...")
+    time.sleep(START_DELAY)
 
-    def update_sensors():
-        current_sensors = [c.sensor_values[i] for i in range(5)]
-        # Ignore completely zeroed out packets (connection drop or start buffer)
-        if all(v == 0.0 for v in current_sensors):
-            return False
-        # Filter out spikes where an individual sensor drops to exactly 0.0 from a white tile value (> 0.45)
-        for i in range(5):
-            val = current_sensors[i]
-            if val == 0.0 and last_valid_sensors[i] > 0.45:
-                pass
-            else:
-                last_valid_sensors[i] = val
-        return True
-
-    def on_black(sensor_idx):
-        return last_valid_sensors[sensor_idx] < BLACK_THRESH
-
-    # ── Wait for first sensor packet ─────────────────────────────
-    while c.sensor_count == 0:
-        time.sleep(0.1)
-    time.sleep(0.5)
-
-    # Initialize sensor validation array with starting values
-    for i in range(5):
-        last_valid_sensors[i] = c.sensor_values[i]
-
-    corners_done  = 0
-    cooldown_until = 0.0
-    last_seen_side = "left"
-    print("Square path: line-following + corner detection…")
-
-    # ── Leave start corner before counting begins ─────────────────
-    set_motor(c, FORWARD_SPEED, FORWARD_SPEED)
-    
-    # Wait until both corner sensors and front three sensors clear the starting junction
-    timeout = time.time() + 1.5
-    while c.running and time.time() < timeout:
-        update_sensors()
-        if not on_black(3) and not on_black(4) and not (on_black(0) and on_black(1) and on_black(2)):
+    for side in range(4):
+        if not c.running:
             break
-        time.sleep(LOOP_DT)
-    time.sleep(0.2)  # Extra padding to be fully clear
 
-    while c.running and corners_done < 4:
+        print("Side {}: moving forward".format(side + 1))
+        set_motor(c, FORWARD_SPEED, FORWARD_SPEED)
+        time.sleep(SIDE_TIME)
 
-        now = time.time()
+        stop_robot()
+        time.sleep(PAUSE_TIME)
 
-        # Update and validate incoming sensor data
-        if not update_sensors():
-            time.sleep(LOOP_DT)
-            continue
+        print("Corner {}: turning left 90 degrees".format(side + 1))
+        set_motor(c, -TURN_SPEED, TURN_SPEED)
+        time.sleep(TURN_TIME)
 
-        mid   = on_black(2)
-        left  = on_black(0)
-        right = on_black(1)
-        lc    = on_black(4)
-        rc    = on_black(3)
+        stop_robot()
+        time.sleep(PAUSE_TIME)
 
-        # ── Corner detected (with cooldown debounce) ──────────────
-        # Triggers if a corner sensor fires OR if all three front sensors see the perpendicular line
-        if (lc or rc or (left and right and mid)) and now > cooldown_until:
-            corners_done += 1
-            print("Corner {} reached! lc={} rc={} 3front={}".format(corners_done, lc, rc, left and right and mid))
+    stop_robot()
+    print("Square complete! Robot stopped.")
 
-            # 1. Stop at the corner
-            set_motor(c, 0.0, 0.0)
-            time.sleep(0.8)
-
-            # 2. Nudge forward so wheels are directly on the corner junction
-            print("Nudging forward onto corner…")
-            set_motor(c, FORWARD_SPEED, FORWARD_SPEED)
-            time.sleep(0.6)
-
-            # 3. Stop before turning
-            set_motor(c, 0.0, 0.0)
-            time.sleep(0.8)
-
-            # 4. Turn LEFT (counter-clockwise)
-            print("Turning left 90°…")
-            set_motor(c, -TURN_SPEED, TURN_SPEED)
-
-            # Phase 1: blind turn to clear initial corner alignment
-            time.sleep(0.5)
-
-            # Phase 2: keep turning until the middle sensor is on the line
-            timeout = time.time() + 3.0
-            while c.running and time.time() < timeout:
-                update_sensors()
-                if on_black(2):
-                    break
-                time.sleep(LOOP_DT)
-
-            # 5. Stop after turn
-            set_motor(c, 0.0, 0.0)
-            time.sleep(0.8)
-            last_seen_side = "right"  # default recovery direction after left turn (in case of overshoot)
-
-            if corners_done == 4:
-                break
-
-            # Cooldown: ignore corner triggers for 1.2 s after turning
-            cooldown_until = time.time() + 1.2
-
-        # ── Normal line-following ─────────────────────────────────
-        elif mid and not left and not right:
-            # Centered on line — go straight
-            set_motor(c, FORWARD_SPEED, FORWARD_SPEED)
-
-        elif left and not right:
-            # Drifted right — steer left (slow left wheel to turn left)
-            set_motor(c, SLOW_SPEED, FORWARD_SPEED)
-            last_seen_side = "left"
-
-        elif right and not left:
-            # Drifted left — steer right (slow right wheel to turn right)
-            set_motor(c, FORWARD_SPEED, SLOW_SPEED)
-            last_seen_side = "right"
-
-        elif left and right:
-            # Both side sensors on line (wide line section) — go straight
-            set_motor(c, FORWARD_SPEED, FORWARD_SPEED)
-
-        else:
-            # Lost the line — steer in the direction of the last seen side
-            if last_seen_side == "left":
-                set_motor(c, SLOW_SPEED, FORWARD_SPEED)
-            else:
-                set_motor(c, FORWARD_SPEED, SLOW_SPEED)
-
-        time.sleep(LOOP_DT)
-
-    # ── Done ──────────────────────────────────────────────────────
-    set_motor(c, 0.0, 0.0)
-    print("Square complete! Robot stopped at start corner.")
-    c.running = False
+    while c.running:
+        time.sleep(0.1)
 
 
 def main():
