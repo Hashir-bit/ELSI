@@ -27,22 +27,29 @@ from connector_task1a import CoppeliaClient
 # Each value is in [0.0, 1.0]; a higher value means the line is detected.
 SENSOR_ORDER = ['left_corner', 'left', 'middle', 'right', 'right_corner']
 
-# ── PID state (persists across control_loop calls) ────────────────────────────
-_prev_error  = 0.0
-_integral    = 0.0
-_on_white_bg = False
+# pid variables to remember last state
+prev_error = 0.0
+integral = 0.0
 
-# ── Tuning parameters ─────────────────────────────────────────────────────────
-Kp           = 1.2    # proportional gain
-Ki           = 0.0    # integral gain      (keep 0 until P+D are stable)
-Kd           = 0.8    # derivative gain    (damps oscillation)
+# to track which surface robot is on
+on_white = False
+white_locked = False
+white_count = 0
 
-BASE_SPEED   = 2.5    # forward speed on straight sections
-MAX_SPEED    = 5.0    # motor saturation cap
-INTEGRAL_CAP = 2.0    # prevents integral windup
+lost_count = 0
+done = False
+finish_count = 0
 
-# Sensor position weights (left-most = -2, centre = 0, right-most = +2)
-_WEIGHTS = {
+# pid gains, tuned by trial and error
+Kp = 1.5
+Ki = 0.0
+Kd = 0.9
+
+base_speed = 2.5
+max_speed = 5.0
+
+# each sensor gets a position value, middle is 0, left is negative, right is positive
+weights = {
     'left_corner':  -2.0,
     'left':         -1.0,
     'middle':        0.0,
@@ -51,38 +58,105 @@ _WEIGHTS = {
 }
 
 
-def control_loop(sensors):
-    global _prev_error, _integral, _on_white_bg
-
-    avg = sum(sensors[k] for k in _WEIGHTS) / 5.0
-
-    # Hysteresis: switch only when clearly past the threshold
-    if avg > 0.6:
-        _on_white_bg = True
-    elif avg < 0.4:
-        _on_white_bg = False
-
-    adjusted = {k: 1.0 - sensors[k] for k in _WEIGHTS} if _on_white_bg else sensors
-
-    # 1. Weighted-average error
-    weighted_sum  = sum(adjusted[k] * w for k, w in _WEIGHTS.items())
-    total_reading = sum(adjusted[k] for k in _WEIGHTS)
-
-    if total_reading < 0.05:
-        error = _prev_error
+def get_speed(error, adjusted):
+    # slow down if corner sensors are active or error is too big (means sharp turn)
+    corners = adjusted['left_corner'] + adjusted['right_corner']
+    if corners > 0.8 or abs(error) > 1.2:
+        return 1.0
+    elif corners > 0.4 or abs(error) > 0.6:
+        return 1.8
     else:
-        error = weighted_sum / total_reading
+        return base_speed
 
-    # 2. PID
-    _integral  = max(-INTEGRAL_CAP, min(INTEGRAL_CAP, _integral + error))
-    derivative = error - _prev_error
-    _prev_error = error
 
-    correction = Kp * error + Ki * _integral + Kd * derivative
+def check_finish(adjusted):
+    # if all 5 sensors see the line at same time its the finish bar
+    return all(adjusted[k] > 0.6 for k in weights)
 
-    # 3. Differential drive
-    left  = max(-MAX_SPEED, min(MAX_SPEED, BASE_SPEED + correction))
-    right = max(-MAX_SPEED, min(MAX_SPEED, BASE_SPEED - correction))
+
+def control_loop(sensors):
+    """Return (left_speed, right_speed) for the current sensor reading.
+
+    `sensors` is a dict, e.g.:
+        {'left_corner': 0.02, 'left': 0.41, 'middle': 0.95,
+         'right': 0.05, 'right_corner': 0.01}
+
+    ------------------------------------------------------------------
+    TODO (participants): implement your PID line-following controller.
+    ------------------------------------------------------------------
+    A typical approach:
+      1. Turn the 5 readings into ONE line-position error
+      2. Feed that error through a PID controller:
+      3. Drive the wheels differentially:
+    """
+    global prev_error, integral
+    global on_white, white_locked, white_count
+    global lost_count, done, finish_count
+
+    if done:
+        return 0.0, 0.0
+
+    # average of all sensors to know if background is white or black
+    avg = sum(sensors[k] for k in weights) / 5.0
+
+    # if avg is high means white background, lock it so it dont switch back
+    if not white_locked:
+        if avg > 0.60:
+            white_count += 1
+        else:
+            white_count = 0
+
+        if white_count >= 2:
+            on_white = True
+            white_locked = True
+
+    # on white background the black line reads low so we flip the values
+    if on_white:
+        adjusted = {k: 1.0 - sensors[k] for k in weights}
+    else:
+        adjusted = sensors
+
+    # check for finish line only after we crossed to white side
+    if white_locked and check_finish(adjusted):
+        finish_count += 1
+        if finish_count >= 3:
+            done = True
+            print("Finish line detected - stopping!")
+            return 0.0, 0.0
+    else:
+        finish_count = 0
+
+    weighted_sum = sum(adjusted[k] * w for k, w in weights.items())
+    total = sum(adjusted[k] for k in weights)
+
+    line_found = total >= 0.15
+
+    if not line_found:
+        lost_count += 1
+    else:
+        lost_count = 0
+
+    # if line is lost for few ticks, rotate towards last known direction
+    if lost_count > 3:
+        t = 1.0
+        if prev_error > 0:
+            left, right = t, -t   # line was on right so turn right
+        else:
+            left, right = -t, t   # line was on left so turn left
+        return left, right
+
+    error = weighted_sum / total
+
+    integral = max(-2.0, min(2.0, integral + error))
+    derivative = error - prev_error
+    prev_error = error
+
+    correction = Kp * error + Ki * integral + Kd * derivative
+
+    speed = get_speed(error, adjusted)
+
+    left  = max(-max_speed, min(max_speed, speed + correction))
+    right = max(-max_speed, min(max_speed, speed - correction))
 
     return left, right
 
@@ -103,7 +177,7 @@ def main():
                 time.sleep(0.02)
                 continue
 
-            left, right = control_loop(last_sensors)
+            left, right = control_loop (last_sensors)
             client.send_motor_command(left, right)
 
             time.sleep(0.05)   # ~20 Hz control loop
